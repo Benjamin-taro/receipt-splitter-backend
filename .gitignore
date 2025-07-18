@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+
+# venv
+venv/
+
+# FastAPI / Pydantic cache
+*.db
+*.sqlite3
+
+# VSCode / IDE
+.vscode/
+.idea/
