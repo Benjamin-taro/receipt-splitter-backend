@@ -2,24 +2,23 @@ import os
 import base64
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from together import Together
 from dotenv import load_dotenv
 import json
+import google.generativeai as genai
 
 load_dotenv()
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
+
 with open("data/menu.json", "r", encoding="utf-8") as f:
     MENU = json.load(f)
 
-
-client = Together(api_key=TOGETHER_API_KEY)
-
 app = FastAPI()
 
-# CORS 許可（Angularローカル用）
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 本番では限定すること
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,58 +26,58 @@ app.add_middleware(
 
 @app.post("/extract")
 async def extract_text(file: UploadFile = File(...)):
-    import json
-
-    # Step 1: 画像を base64 に
+    # Step 1: read image bytes
     image_bytes = await file.read()
-    base64_str = base64.b64encode(image_bytes).decode("utf-8")
     mime = file.content_type or "image/jpeg"
-    data_uri = f"data:{mime};base64,{base64_str}"
 
-    # Step 2: Together に問い合わせ
-    prompt = '''
+    # Step 2: prompt as before
+    prompt = """
         You are an expert receipt parser.
 
-        Reply with valid JSON only. DO NOT use Markdown or any explanations. Do not wrap your JSON in triple backticks. Just return pure JSON.
+        Reply with valid JSON only. Do NOT use Markdown or explanations.
+
+        Return exactly:
         {
-        "items":[{ "name":string, "quantity":number, "price":number }],
-        "total":number,
-        "service_charge_10_percent":boolean
+          "items":[{ "name":string, "quantity":number, "price":number }],
+          "total":number,
+          "service_charge_10_percent":boolean
         }
 
         Guidelines:
-        • "quantity" = number of units (1, 2 …).
-        • "price"    = unit price (not subtotal).
-        • Ignore tips and discounts.
-        • If a 10% service charge is present, set "service_charge_10_percent" to true.
-        • Reply with JSON only. Do not add any explanation, description, or Markdown. Just return pure valid JSON.
-    '''
+        - "quantity" = number of units.
+        - "price" = unit price.
+        - Ignore discounts/tips.
+        - If a 10% service charge appears, set service_charge_10_percent = true.
+    """
 
+    model = genai.GenerativeModel("gemini-2.0-flash")
 
-    response = client.chat.completions.create(
-        model="meta-llama/Llama-Vision-Free",
-        messages=[
-            {"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": data_uri}}
-            ]}
+    # Step 3: Gemini Vision API call
+    response = model.generate_content(
+        [
+            prompt,
+            {"mime_type": mime, "data": image_bytes}
         ],
-        max_tokens=1024,
+        generation_config={"temperature": 0},  # JSON安定
     )
 
-    # Step 3: レスポンス処理 ←⭐ここ！
-    import re
-    raw_content = response.choices[0].message.content
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_content, re.DOTALL)
-    try:
-        if match:
-            parsed = json.loads(match.group(1))
-        else:
-            parsed = json.loads(raw_content)
-    except Exception as e:
-        return {"error": "invalid JSON", "raw": raw_content}
+    raw = response.text.strip()
 
-    # Step 4: 照合・整形
+    # --- remove ```json ... ``` or ``` ... ``` fences if they exist ---
+    if raw.startswith("```"):
+        # まずバッククォート全部剥がす（```json ... ``` でも ``` ... ``` でも対応）
+        raw = raw.strip("`").strip()
+        # 先頭が "json\n" / "json\r\n" みたいになってたら取る
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+
+    # Step 4: Parse JSON
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {"error": "Invalid JSON", "raw": raw}
+
+    # Step 5: Validate against MENU.json
     validated_items = []
     for item in parsed.get("items", []):
         name = item.get("name")
@@ -96,8 +95,8 @@ async def extract_text(file: UploadFile = File(...)):
         })
 
     total = sum(
-        (item["expectedPrice"] if item["expectedPrice"] is not None else item["price"]) * item["quantity"]
-        for item in validated_items
+        (i["expectedPrice"] if i["expectedPrice"] is not None else i["price"]) * i["quantity"]
+        for i in validated_items
     )
 
     return {
